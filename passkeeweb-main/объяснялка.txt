@@ -1,0 +1,480 @@
+** MAIN **
+# Описание кода SecurePass Manager
+
+## Общая структура приложения
+
+Это Flask-приложение представляет собой менеджер паролей с иерархической системой хранения и гибким разграничением доступа. Код организован по принципу "всё в одном файле" для простоты развертывания и понимания.
+
+## Импорты и настройка
+
+```python
+from flask import Flask, render_template, redirect, url_for, request, flash, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from flask_bcrypt import Bcrypt
+from datetime import datetime
+from functools import wraps
+```
+
+Приложение использует стандартный набор расширений Flask:
+- **Flask** - основа веб-фреймворка
+- **SQLAlchemy** - ORM для работы с базой данных
+- **Flask-Login** - управление сессиями пользователей
+- **Flask-Bcrypt** - хеширование паролей
+
+Конфигурация приложения минимальна:
+```python
+app.config['SECRET_KEY'] = 'v3x4sm!p4ss'  # Секретный ключ для сессий
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///database.db'  # SQLite база данных
+```
+
+## Модели данных (ORM-классы)
+
+### Role (Роль)
+```python
+class Role(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), unique=True, nullable=False)
+    description = db.Column(db.String(200))
+    users = db.relationship('User', backref='role', lazy=True)
+```
+Роли определяют глобальные права пользователей. Метод `get_defaults()` возвращает предопределенные роли: admin, engineer, analyst, user.
+
+### Group (Группа)
+```python
+class Group(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), unique=True, nullable=False)
+    description = db.Column(db.String(200))
+    members = db.relationship('User', secondary=user_group, backref='groups', lazy='dynamic')
+```
+Группы позволяют объединять пользователей для коллективного доступа к хранилищам. Связь многие-ко-многим реализована через вспомогательную таблицу `user_group`.
+
+### User (Пользователь)
+```python
+class User(db.Model, UserMixin):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(150), unique=True, nullable=False)
+    password = db.Column(db.String(255), nullable=False)
+    role_id = db.Column(db.Integer, db.ForeignKey('role.id'), nullable=True)
+    is_active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    containers = db.relationship('Container', backref='owner', lazy=True)
+    passwords = db.relationship('Password', backref='owner', lazy=True)
+```
+Ключевая модель, наследующая `UserMixin` для интеграции с Flask-Login. Содержит связи с контейнерами и паролями, которые принадлежат пользователю.
+
+### Container (Хранилище/папка)
+```python
+class Container(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(150), nullable=False)
+    icon = db.Column(db.String(10), default='🔐')
+    color = db.Column(db.String(20), default='#6366f1')
+    parent_id = db.Column(db.Integer, db.ForeignKey('container.id'), nullable=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    is_shared = db.Column(db.Boolean, default=False)
+```
+Реализует иерархическую структуру через self-референс (родительская папка). Каждый контейнер принадлежит конкретному пользователю, но может быть расшарен через механизм доступа.
+
+### ContainerAccess (Правила доступа к контейнерам)
+```python
+class ContainerAccess(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    container_id = db.Column(db.Integer, db.ForeignKey('container.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    group_id = db.Column(db.Integer, db.ForeignKey('group.id'), nullable=True)
+    can_write = db.Column(db.Boolean, default=False)
+    granted_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+```
+Позволяет гибко настраивать доступ: либо для конкретного пользователя, либо для целой группы. Флаг `can_write` определяет, может ли пользователь редактировать содержимое.
+
+### Password (Запись пароля)
+```python
+class Password(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(150), nullable=False)
+    login = db.Column(db.String(150))
+    password = db.Column(db.String(255))
+    url = db.Column(db.String(300))
+    notes = db.Column(db.Text)
+    container_id = db.Column(db.Integer, db.ForeignKey('container.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+```
+Хранит учетные данные. Пароль хранится в открытом виде (рекомендуется добавить шифрование).
+
+### AuditLog (Логирование действий)
+```python
+class AuditLog(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    password_id = db.Column(db.Integer, db.ForeignKey('password.id'), nullable=True)
+    container_id = db.Column(db.Integer, db.ForeignKey('container.id'), nullable=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    action = db.Column(db.String(100), nullable=False)
+    details = db.Column(db.Text)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+```
+Фиксирует все важные действия пользователей для последующего аудита.
+
+## Вспомогательные функции
+
+### load_user
+```python
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+```
+Обязательная функция для Flask-Login, загружает пользователя по ID.
+
+### admin_required (декоратор)
+```python
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not current_user.is_authenticated or not current_user.is_admin():
+            flash("Доступ запрещён", "danger")
+            return redirect(url_for("dashboard"))
+        return f(*args, **kwargs)
+    return decorated
+```
+Защищает маршруты, доступные только администраторам. Использует `functools.wraps` для сохранения метаданных оригинальной функции.
+
+### log_action
+```python
+def log_action(action, password_id=None, container_id=None, details=None):
+    entry = AuditLog(
+        password_id=password_id,
+        container_id=container_id,
+        user_id=current_user.id,
+        action=action,
+        details=details
+    )
+    db.session.add(entry)
+```
+Утилита для создания записей аудита. Не делает коммит, чтобы можно было группировать несколько действий в одну транзакцию.
+
+### can_access_container
+```python
+def can_access_container(container, user=None):
+    if user is None:
+        user = current_user
+    if user.is_admin():
+        return True
+    if container.user_id == user.id:
+        return True
+    # Проверка прямого доступа
+    user_access = ContainerAccess.query.filter_by(
+        container_id=container.id, user_id=user.id
+    ).first()
+    if user_access:
+        return True
+    # Проверка доступа через группы
+    user_group_ids = [g.id for g in user.groups]
+    if user_group_ids:
+        group_access = ContainerAccess.query.filter(
+            ContainerAccess.container_id == container.id,
+            ContainerAccess.group_id.in_(user_group_ids)
+        ).first()
+        if group_access:
+            return True
+    return False
+```
+Ключевая функция системы безопасности. Проверяет, имеет ли пользователь доступ к контейнеру в следующем порядке:
+1. Администратор имеет доступ ко всему
+2. Владелец имеет доступ к своему контейнеру
+3. Проверка прямых правил доступа для пользователя
+4. Проверка доступа через группы пользователя
+
+### get_shared_containers
+```python
+def get_shared_containers(user):
+    # Прямой доступ
+    direct = db.session.query(Container).join(
+        ContainerAccess, ContainerAccess.container_id == Container.id
+    ).filter(
+        ContainerAccess.user_id == user.id,
+        Container.user_id != user.id
+    ).all()
+    
+    # Доступ через группы
+    user_group_ids = [g.id for g in user.groups]
+    group_shared = []
+    if user_group_ids:
+        group_shared = db.session.query(Container).join(
+            ContainerAccess, ContainerAccess.container_id == Container.id
+        ).filter(
+            ContainerAccess.group_id.in_(user_group_ids),
+            Container.user_id != user.id
+        ).all()
+    
+    # Убираем дубликаты
+    all_shared = list({c.id: c for c in direct + group_shared}.values())
+    return all_shared
+```
+Возвращает все контейнеры, к которым пользователь имеет доступ, но не является владельцем. Используется для отображения общих хранилищ в интерфейсе.
+
+## Маршруты (Routes)
+
+### Аутентификация
+- **`/register`** - регистрация нового пользователя. Проверяет уникальность имени, хеширует пароль через bcrypt.
+- **`/login`** - вход в систему. Проверяет учетные данные и создает сессию.
+- **`/logout`** - выход из системы.
+
+### Профиль
+- **`/profile`** - просмотр профиля и смена пароля. Требует подтверждения текущего пароля.
+
+### Дашборд и навигация
+- **`/dashboard`** - главная страница. Показывает корневые контейнеры пользователя и общие контейнеры.
+- **`/container/<int:container_id>`** - открытие контейнера. Проверяет доступ, строит хлебные крошки, показывает подконтейнеры, пароли и правила доступа.
+
+### Управление контейнерами
+- **`/create_container`** - создание нового контейнера (POST). Может быть создан как корневой или дочерний.
+- **`/delete_container/<int:container_id>`** - рекурсивное удаление контейнера и всего его содержимого.
+
+### Управление доступом
+- **`/container/<int:container_id>/grant_access`** - выдача прав на контейнер пользователю или группе.
+- **`/container/<int:container_id>/revoke_access/<int:access_id>`** - отзыв прав.
+
+### Управление паролями
+- **`/create_password`** - создание новой записи пароля.
+- **`/view_password/<int:password_id>`** - логирует просмотр пароля (важно для аудита).
+- **`/edit_password/<int:password_id>`** - редактирование записи.
+- **`/delete_password/<int:password_id>`** - удаление записи.
+- **`/password/<int:password_id>/history`** - история изменений пароля.
+
+### Администрирование
+- **`/admin`** - панель администратора.
+- **`/admin/set_role`** - назначение роли пользователю.
+- **`/admin/set_group`** - управление членством в группах.
+- **`/admin/create_group`** - создание группы.
+- **`/admin/delete_group/<int:group_id>`** - удаление группы.
+- **`/admin/toggle_user/<int:user_id>`** - активация/деактивация пользователя.
+
+## Особенности реализации
+
+### Иерархическая структура контейнеров
+Контейнеры организованы как дерево через поле `parent_id`. При открытии контейнера строятся "хлебные крошки" путем подъема по родительским ссылкам до корня.
+
+### Рекурсивное удаление
+При удалении контейнера функция `delete_subcontainers` рекурсивно обходит все дочерние контейнеры и удаляет связанные с ними пароли и логи аудита.
+
+### Проверка доступа на лету
+Все маршруты, работающие с контейнерами, вызывают `can_access_container()` перед выполнением операций. Это гарантирует, что пользователь не получит доступ к чужим данным даже при прямом переходе по URL.
+
+### Логирование действий
+Критические операции (создание, просмотр, изменение, удаление) логируются через функцию `log_action()`. Это создает полную историю изменений для аудита.
+
+## Точка входа
+```python
+if __name__ == "__main__":
+    app.run(debug=True)
+```
+
+Запускает приложение в режиме отладки при прямом выполнении скрипта.
+
+# init_db.py — Скрипт инициализации базы данных
+
+## Общее описание
+
+`init_db.py` — это отдельный служебный скрипт для первоначальной настройки базы данных менеджера паролей Vault. Он создает все необходимые таблицы, заполняет их начальными данными (роли, группы) и создает учетную запись администратора.
+
+Скрипт предназначен для однократного запуска перед первым использованием приложения.
+
+## Использование
+
+### Базовый запуск
+```bash
+python init_db.py
+```
+Запустит инициализацию с параметрами по умолчанию:
+- Администратор: `admin`
+- Пароль: `Admin@1234`
+
+### Запуск с кастомным администратором
+```bash
+python init_db.py --admin-user myadmin --admin-pass MySecurePass123
+```
+Создаст администратора с указанными логином и паролем.
+
+## Параметры командной строки
+
+| Параметр | Описание | Значение по умолчанию |
+|----------|----------|------------------------|
+| `--admin-user` | Имя пользователя-администратора | `admin` |
+| `--admin-pass` | Пароль администратора | `Admin@1234` |
+
+## Импорты и зависимости
+
+```python
+import argparse
+from app import app, db, bcrypt, Role, User, Group
+```
+
+Скрипт импортирует необходимые компоненты из основного приложения:
+- `app` - Flask-приложение (для контекста)
+- `db` - объект SQLAlchemy для работы с БД
+- `bcrypt` - для хеширования пароля администратора
+- Модели `Role`, `User`, `Group` - для создания записей
+
+## Константы
+
+```python
+DEFAULT_ADMIN_USERNAME = "admin"
+DEFAULT_ADMIN_PASSWORD = "Admin@1234"
+```
+Значения по умолчанию для учетной записи администратора, используемые, если параметры не переданы через командную строку.
+
+## Функция init_db()
+
+### Сигнатура
+```python
+def init_db(admin_username=DEFAULT_ADMIN_USERNAME, admin_password=DEFAULT_ADMIN_PASSWORD):
+```
+
+### Контекст приложения
+```python
+with app.app_context():
+```
+Создает контекст Flask-приложения, необходимый для работы с моделями и базой данных вне основного цикла приложения.
+
+### Создание таблиц
+```python
+db.create_all()
+print("✓ Таблицы созданы")
+```
+Создает все таблицы в базе данных на основе определенных в `app.py` моделей. Если таблицы уже существуют, команда ничего не делает.
+
+### Создание ролей
+
+```python
+for role_data in Role.get_defaults():
+    if not Role.query.filter_by(name=role_data['name']).first():
+        role = Role(**role_data)
+        db.session.add(role)
+        print(f"  + Роль: {role_data['name']}")
+```
+
+Перебирает предопределенные роли из метода `get_defaults()` модели `Role`:
+- `admin` - полный доступ
+- `engineer` - доступ к техническим хранилищам
+- `analyst` - доступ к аналитическим данным
+- `user` - обычный пользователь
+
+Для каждой роли проверяется, существует ли она уже в БД. Если нет — создается новая запись.
+
+### Создание групп
+
+```python
+default_groups = [
+    {"name": "engineering", "description": "Инженеры и разработчики"},
+    {"name": "analytics", "description": "Аналитики данных"},
+    {"name": "management", "description": "Руководство"},
+]
+```
+
+Создает три предопределенные группы для удобства организации пользователей. Каждая группа проверяется на существование перед созданием.
+
+### Создание администратора
+
+```python
+if not User.query.filter_by(username=admin_username).first():
+    admin_role = Role.query.filter_by(name='admin').first()
+    hashed = bcrypt.generate_password_hash(admin_password).decode('utf-8')
+    admin = User(
+        username=admin_username,
+        password=hashed,
+        role_id=admin_role.id if admin_role else None
+    )
+    db.session.add(admin)
+```
+
+1. Проверяет, не существует ли уже пользователь с указанным именем
+2. Находит роль администратора в БД
+3. Хеширует переданный пароль с помощью bcrypt
+4. Создает объект пользователя с ролью администратора
+5. Добавляет в сессию для сохранения
+
+### Завершение транзакции
+```python
+db.session.commit()
+```
+Сохраняет все изменения в базе данных.
+
+## Точка входа
+
+```python
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Vault — инициализация БД")
+    parser.add_argument("--admin-user", default=DEFAULT_ADMIN_USERNAME,
+                        help=f"Имя администратора (по умолчанию: {DEFAULT_ADMIN_USERNAME})")
+    parser.add_argument("--admin-pass", default=DEFAULT_ADMIN_PASSWORD,
+                        help="Пароль администратора")
+    args = parser.parse_args()
+    init_db(args.admin_user, args.admin_pass)
+```
+
+При прямом запуске скрипта:
+1. Создается парсер аргументов командной строки
+2. Определяются два опциональных параметра с значениями по умолчанию
+3. Аргументы парсятся и передаются в функцию `init_db()`
+
+## Вывод скрипта
+
+Скрипт выводит информационные сообщения о процессе инициализации:
+
+```
+✓ Таблицы созданы
+  + Роль: admin
+  + Роль: engineer
+  + Роль: analyst
+  + Роль: user
+  + Группа: engineering
+  + Группа: analytics
+  + Группа: management
+
+✓ Администратор создан:
+  Логин:  admin
+  Пароль: Admin@1234
+
+  ⚠  Смените пароль после первого входа!
+
+✓ Инициализация завершена. Запустите: python app.py
+```
+
+## Особенности и безопасность
+
+### Проверки существования
+Скрипт безопасен для повторного запуска — он проверяет наличие каждой сущности перед созданием и не перезаписывает существующие данные.
+
+### Хранение пароля
+Пароль администратора передается в открытом виде как аргумент командной строки. Это приемлемо для скрипта инициализации, но важно сменить пароль при первом входе.
+
+### Предупреждение о смене пароля
+Скрипт выводит предупреждение о необходимости сменить пароль после первого входа — важная практика безопасности.
+
+### Обработка отсутствия ролей
+Код учитывает ситуацию, если роль администратора по какой-то причине не создалась:
+```python
+role_id=admin_role.id if admin_role else None
+```
+
+## Типичный сценарий использования
+
+1. Установка приложения
+2. Запуск `python init_db.py` для создания структуры БД
+3. Запуск основного приложения `python app.py`
+4. Вход под учетной записью администратора
+5. Смена пароля администратора через профиль
+6. Создание дополнительных пользователей и групп через админ-панель
+
+## Возможные ошибки и их решение
+
+### "ModuleNotFoundError: No module named 'app'"
+Убедитесь, что скрипт запускается из той же директории, где находится `app.py`, или добавьте путь в PYTHONPATH.
+
+### "sqlite3.OperationalError: unable to open database file"
+Проверьте права на запись в директории, где создается файл базы данных.
+
+### Ошибка подключения к БД
+Убедитесь, что URI базы данных в `app.config['SQLALCHEMY_DATABASE_URI']` корректен и доступен для записи.
+
